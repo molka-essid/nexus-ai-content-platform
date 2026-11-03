@@ -1,0 +1,291 @@
+// Prisma schema for the ALTA Services content-generation dashboard.
+// See prisma/schema.prisma docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  EDITOR // creates and edits drafts
+  VALIDATOR // reviews and approves/rejects/publishes (Tatiana)
+  ADMIN // manages brand config and users, in addition to VALIDATOR powers
+}
+
+enum Platform {
+  FACEBOOK
+  LINKEDIN
+  INSTAGRAM
+  TIKTOK
+}
+
+enum PublicationStatus {
+  DRAFT
+  NEEDS_REVIEW
+  SCHEDULED
+  PUBLISHED
+}
+
+// Content pillars ALTA Services publishes about. Kept as an enum (rather than
+// free text) because it's a deliberate, small, stable content policy rather
+// than an open creative field.
+enum ContentCategory {
+  RECRUITMENT
+  HUMAN_RESOURCES
+  EMPLOYEE_WELLBEING
+}
+
+enum AIRequestType {
+  PUBLICATION
+  CALENDAR
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(EDITOR)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  uploadedImages        Image[]
+  createdPublications   Publication[]     @relation("PublicationCreatedBy")
+  aiGenerationLogs      AIGenerationLog[]
+  connectedSocialAccounts SocialAccount[]
+}
+
+// A connected social platform account this single-workspace tool can publish
+// to. One per platform (connecting a new account for a platform replaces the
+// old one) — this is a single-workspace tool, not a multi-tenant one.
+model SocialAccount {
+  id                String    @id @default(cuid())
+  platform          Platform
+  externalAccountId String // the platform's own id for the connected page/account
+  displayName       String? // username/page name shown in the UI
+  accessToken       String    @db.Text
+  refreshToken      String?   @db.Text
+  expiresAt         DateTime?
+  connectedBy       User      @relation(fields: [connectedById], references: [id])
+  connectedById     String
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@unique([platform])
+}
+
+// The developer-app-level credentials for each social platform (as opposed
+// to SocialAccount, which holds a specific connected end-user account's
+// tokens). Editable from the app itself (Brand page) so the workspace owner
+// isn't dependent on a developer to redeploy with new env vars. Singleton at
+// the application layer, same pattern as BrandProfile below.
+model SocialAppConfig {
+  id            String   @id @default(cuid())
+  // Facebook Page posting — classic Facebook Login, "Settings > Basic" on
+  // the Meta app dashboard.
+  metaAppId     String?
+  metaAppSecret String?
+  // Instagram — Business Login for Instagram uses a DIFFERENT app id/secret
+  // pair than the Meta App ID above, despite living in the same Meta app.
+  // Found under Instagram > API setup with Instagram Login in the dashboard.
+  instagramAppId     String?
+  instagramAppSecret String?
+  tiktokClientKey    String?
+  tiktokClientSecret String?
+  linkedinClientId     String?
+  linkedinClientSecret String?
+  updatedAt          DateTime @updatedAt
+}
+
+// Single source of truth for logo, voice, and guidelines that every AI
+// generation call reads at request time. Treated as a singleton at the
+// application layer (there is always exactly one row) rather than enforced
+// via a DB constraint, since a hard singleton constraint adds complexity
+// this internal tool doesn't need.
+model BrandProfile {
+  id                      String   @id @default(cuid())
+  name                    String   @default("ALTA Services")
+  slogan                  String?
+  logoUrl                 String?
+  colorPrimary            String   @default("#0B2545")
+  colorAccent             String   @default("#F2A93B")
+  colorBackground         String   @default("#EAF1FB")
+  toneGuidelines          String?  @db.Text
+  communicationGuidelines String?  @db.Text
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+}
+
+model Image {
+  id           String   @id @default(cuid())
+  url          String
+  storagePath  String
+  filename     String
+  altText      String?
+  tags         String[]
+  uploadedBy   User     @relation(fields: [uploadedById], references: [id])
+  uploadedById String
+  displayedInPublications Publication[] @relation("PublicationDisplayImage")
+  sourceForPublications   Publication[] @relation("PublicationSourceImage")
+  createdAt    DateTime @default(now())
+
+  @@index([uploadedById])
+}
+
+model Publication {
+  id            String            @id @default(cuid())
+  title         String
+  hook          String            @db.Text
+  caption       String            @db.Text
+  cta           String
+  hashtags      String[]
+  category      ContentCategory
+  objective     String
+  audience      String
+  tone          String
+  visualConcept String            @db.Text
+  // Short bullet points and an optional standout-detail badge, used to
+  // render the flyer's content section — persisted (not just generated
+  // in-memory) so the flyer can be regenerated later without re-running AI.
+  highlights String[]
+  badge      String?
+  status     PublicationStatus @default(DRAFT)
+  // Opt-in: when true and this publication is scheduled (has a calendarSlot),
+  // the daily auto-publish cron job (see /api/cron/auto-publish) posts it to
+  // every connected social account once its scheduledDate has arrived, then
+  // marks it PUBLISHED.
+  autoPublish Boolean @default(false)
+
+  // The currently-displayed image — usually one of several composited
+  // flyer style options (see sourceImage below), but could be any Image.
+  image   Image?  @relation("PublicationDisplayImage", fields: [imageId], references: [id])
+  imageId String?
+
+  // The underlying photo (real upload or AI-generated) flyer styles are
+  // composited from. Kept separate from `image` so re-rendering styles
+  // never composites text onto an already-composited flyer.
+  sourceImage   Image?  @relation("PublicationSourceImage", fields: [sourceImageId], references: [id])
+  sourceImageId String?
+
+  calendarSlot CalendarSlot?
+
+  variants       PlatformVariant[]
+  generationLogs AIGenerationLog[]
+
+  createdBy   User   @relation("PublicationCreatedBy", fields: [createdById], references: [id])
+  createdById String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([category])
+  @@index([createdById])
+}
+
+// Per-platform adaptation of a Publication. A single generation request fans
+// out into one PlatformVariant per requested platform, so the canonical
+// caption/hashtags/cta on Publication never need duplicating per platform.
+model PlatformVariant {
+  id            String      @id @default(cuid())
+  publication   Publication @relation(fields: [publicationId], references: [id], onDelete: Cascade)
+  publicationId String
+  platform      Platform
+  caption       String      @db.Text
+  hashtags      String[]
+  cta           String
+  // Set once a real publish attempt to the connected social account
+  // succeeds or fails — separate from Publication.status (which is this
+  // app's own in-workspace state, e.g. auto-publish flips that regardless
+  // of whether a social account is even connected).
+  externalPostId  String?
+  externalPostUrl String?
+  publishedAt     DateTime?
+  publishError    String?     @db.Text
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@unique([publicationId, platform])
+}
+
+model CalendarWeek {
+  id        String   @id @default(cuid())
+  weekStart DateTime // Monday of the week (date-only convention, stored at midnight UTC)
+  theme     String?
+  notes     String?  @db.Text
+  slots     CalendarSlot[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([weekStart])
+}
+
+// A planned slot on the calendar, independent of whether a publication has
+// been generated for it yet — this is what makes "plan the week" a separate
+// step from "generate the copy for each day". `scheduledDate` is the source
+// of truth for where a slot renders on the calendar (date-only convention,
+// stored at midnight UTC, like CalendarWeek.weekStart) — it's set directly
+// whether the slot came from an AI week-batch generation or was added
+// ad-hoc by clicking a date, so the calendar view never needs to derive a
+// date from calendarWeekId + a day offset.
+model CalendarSlot {
+  id             String        @id @default(cuid())
+  scheduledDate  DateTime
+  // Set for slots created via the AI "generate a week" batch flow (for theme
+  // grouping); null for ad-hoc slots added directly on the calendar.
+  calendarWeek   CalendarWeek? @relation(fields: [calendarWeekId], references: [id], onDelete: Cascade)
+  calendarWeekId String?
+  platform       Platform
+  category       ContentCategory
+  objective      String
+
+  publication   Publication? @relation(fields: [publicationId], references: [id])
+  publicationId String?      @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([calendarWeekId])
+  @@index([scheduledDate])
+}
+
+// Singleton (application-layer, like BrandProfile above): the shared,
+// site-wide "are the free AI providers currently out of quota" state. Set
+// when generateJSON reports every configured free provider is rate-limited,
+// cleared on the next successful generation — read by /api/ai/quota-status
+// so every staff member sees the same red/green light, not just whoever hit
+// the limit.
+model AiQuotaStatus {
+  id          String    @id @default(cuid())
+  blockedUntil DateTime?
+  updatedAt   DateTime  @updatedAt
+}
+
+// Audit trail of every AI call: what was asked, what came back. Enables
+// debugging prompts and re-generating without re-deriving inputs.
+model AIGenerationLog {
+  id            String        @id @default(cuid())
+  requestType   AIRequestType
+  inputParams   Json
+  rawResponse   Json
+  publication   Publication?  @relation(fields: [publicationId], references: [id])
+  publicationId String?
+  requestedBy   User?         @relation(fields: [requestedById], references: [id])
+  requestedById String?
+  createdAt     DateTime      @default(now())
+
+  @@index([publicationId])
+}
